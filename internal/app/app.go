@@ -59,6 +59,7 @@ type XAuthConfig struct {
 	APISecret          string   `json:"api_secret,omitempty"`
 	AccessToken        string   `json:"access_token,omitempty"`
 	AccessTokenSecret  string   `json:"access_token_secret,omitempty"`
+	UserID             string   `json:"user_id,omitempty"`
 	OAuth2ClientID     string   `json:"oauth2_client_id,omitempty"`
 	OAuth2ClientSecret string   `json:"oauth2_client_secret,omitempty"`
 	OAuth2RedirectURI  string   `json:"oauth2_redirect_uri,omitempty"`
@@ -92,6 +93,7 @@ type createTweetJSONRequest struct {
 	Text              string   `json:"text"`
 	MediaBase64       []string `json:"media_base64"`
 	MediaContentTypes []string `json:"media_content_types"`
+	ReplyToTweetID    string   `json:"reply_to_tweet_id"`
 }
 
 type mediaUploadInput struct {
@@ -183,6 +185,7 @@ func newRouter(app *App) *gin.Engine {
 	protected.Use(app.authMiddleware())
 	{
 		protected.POST("/v1/tweets", app.handleCreateTweet)
+		protected.GET("/v1/timeline", app.handleGetTimeline)
 	}
 
 	return router
@@ -282,6 +285,9 @@ func overrideConfigFromEnv(cfg *Config) {
 	}
 	if v := strings.TrimSpace(os.Getenv("X_ACCESS_TOKEN_SECRET")); v != "" {
 		cfg.X.AccessTokenSecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_USER_ID")); v != "" {
+		cfg.X.UserID = v
 	}
 	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_CLIENT_ID")); v != "" {
 		cfg.X.OAuth2ClientID = v
@@ -468,7 +474,7 @@ func (a *App) handleCreateTweet(c *gin.Context) {
 		return
 	}
 
-	text, mediaInputs, err := parseTweetRequest(c)
+	text, mediaInputs, replyToTweetID, err := parseTweetRequest(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -487,7 +493,7 @@ func (a *App) handleCreateTweet(c *gin.Context) {
 		uploaded = append(uploaded, ref)
 	}
 
-	tweetResp, err := poster.CreateTweet(ctx, text, uploaded)
+	tweetResp, err := poster.CreateTweet(ctx, text, uploaded, replyToTweetID)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
@@ -504,7 +510,54 @@ func (a *App) handleCreateTweet(c *gin.Context) {
 	})
 }
 
-func parseTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
+func (a *App) handleGetTimeline(c *gin.Context) {
+	poster, err := a.getPoster()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	a.mu.RLock()
+	userID := strings.TrimSpace(a.cfg.X.UserID)
+	a.mu.RUnlock()
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "X_USER_ID is not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	params := xdk.Params{"id": userID}
+
+	// Forward supported query parameters to X API.
+	queryKeys := []string{
+		"max_results", "pagination_token",
+		"since_id", "until_id",
+		"start_time", "end_time",
+		"exclude",
+		"tweet.fields", "user.fields", "media.fields",
+		"expansions", "poll.fields", "place.fields",
+	}
+	for _, key := range queryKeys {
+		if v := strings.TrimSpace(c.Query(key)); v != "" {
+			paramKey := strings.ReplaceAll(key, ".", "_")
+			params[paramKey] = v
+		}
+	}
+
+	timeline, err := poster.GetTimeline(ctx, params)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	a.persistOAuth2Token(poster)
+
+	c.JSON(http.StatusOK, timeline)
+}
+
+func parseTweetRequest(c *gin.Context) (string, []mediaUploadInput, string, error) {
 	contentType := c.GetHeader("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		return parseMultipartTweetRequest(c)
@@ -512,39 +565,40 @@ func parseTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
 	return parseJSONTweetRequest(c)
 }
 
-func parseMultipartTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
+func parseMultipartTweetRequest(c *gin.Context) (string, []mediaUploadInput, string, error) {
 	text := strings.TrimSpace(c.PostForm("text"))
+	replyToTweetID := strings.TrimSpace(c.PostForm("reply_to_tweet_id"))
 
 	form, err := c.MultipartForm()
 	if err != nil {
-		return "", nil, fmt.Errorf("invalid multipart request: %w", err)
+		return "", nil, "", fmt.Errorf("invalid multipart request: %w", err)
 	}
 
 	files := form.File["media"]
 	if len(files) > maxMediaCount {
-		return "", nil, fmt.Errorf("too many media files, max is %d", maxMediaCount)
+		return "", nil, "", fmt.Errorf("too many media files, max is %d", maxMediaCount)
 	}
 	if text == "" && len(files) == 0 {
-		return "", nil, errors.New("text or media is required")
+		return "", nil, "", errors.New("text or media is required")
 	}
 
 	media := make([]mediaUploadInput, 0, len(files))
 	for _, fh := range files {
 		f, err := fh.Open()
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
 
 		data, readErr := io.ReadAll(io.LimitReader(f, maxMediaBytes+1))
 		closeErr := f.Close()
 		if readErr != nil {
-			return "", nil, readErr
+			return "", nil, "", readErr
 		}
 		if closeErr != nil {
-			return "", nil, closeErr
+			return "", nil, "", closeErr
 		}
 		if int64(len(data)) > maxMediaBytes {
-			return "", nil, fmt.Errorf("file %q exceeds max size %d bytes", fh.Filename, maxMediaBytes)
+			return "", nil, "", fmt.Errorf("file %q exceeds max size %d bytes", fh.Filename, maxMediaBytes)
 		}
 
 		contentType := fh.Header.Get("Content-Type")
@@ -558,38 +612,38 @@ func parseMultipartTweetRequest(c *gin.Context) (string, []mediaUploadInput, err
 		})
 	}
 
-	return text, media, nil
+	return text, media, replyToTweetID, nil
 }
 
-func parseJSONTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
+func parseJSONTweetRequest(c *gin.Context) (string, []mediaUploadInput, string, error) {
 	var req createTweetJSONRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 
 	text := strings.TrimSpace(req.Text)
 	if text == "" && len(req.MediaBase64) == 0 {
-		return "", nil, errors.New("text or media_base64 is required")
+		return "", nil, "", errors.New("text or media_base64 is required")
 	}
 	if len(req.MediaBase64) > maxMediaCount {
-		return "", nil, fmt.Errorf("too many media items, max is %d", maxMediaCount)
+		return "", nil, "", fmt.Errorf("too many media items, max is %d", maxMediaCount)
 	}
 	if len(req.MediaContentTypes) > 0 && len(req.MediaContentTypes) != len(req.MediaBase64) {
-		return "", nil, errors.New("media_content_types length must match media_base64 length")
+		return "", nil, "", errors.New("media_content_types length must match media_base64 length")
 	}
 
 	media := make([]mediaUploadInput, 0, len(req.MediaBase64))
 	for i, item := range req.MediaBase64 {
 		raw := strings.TrimSpace(item)
 		if raw == "" {
-			return "", nil, fmt.Errorf("media_base64[%d] is empty", i)
+			return "", nil, "", fmt.Errorf("media_base64[%d] is empty", i)
 		}
 		data, err := base64.StdEncoding.DecodeString(raw)
 		if err != nil {
-			return "", nil, fmt.Errorf("media_base64[%d] decode failed: %w", i, err)
+			return "", nil, "", fmt.Errorf("media_base64[%d] decode failed: %w", i, err)
 		}
 		if int64(len(data)) > maxMediaBytes {
-			return "", nil, fmt.Errorf("media_base64[%d] exceeds max size %d bytes", i, maxMediaBytes)
+			return "", nil, "", fmt.Errorf("media_base64[%d] exceeds max size %d bytes", i, maxMediaBytes)
 		}
 
 		contentType := ""
@@ -605,7 +659,7 @@ func parseJSONTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
 		})
 	}
 
-	return text, media, nil
+	return text, media, strings.TrimSpace(req.ReplyToTweetID), nil
 }
 
 func (p *Poster) UploadMedia(ctx context.Context, data []byte, contentType string) (MediaRef, error) {
@@ -790,10 +844,15 @@ func mediaCategoryFromType(contentType string) string {
 	}
 }
 
-func (p *Poster) CreateTweet(ctx context.Context, text string, media []MediaRef) (xdk.JSON, error) {
+func (p *Poster) CreateTweet(ctx context.Context, text string, media []MediaRef, replyToTweetID string) (xdk.JSON, error) {
 	body := map[string]any{}
 	if strings.TrimSpace(text) != "" {
 		body["text"] = strings.TrimSpace(text)
+	}
+	if strings.TrimSpace(replyToTweetID) != "" {
+		body["reply"] = map[string]any{
+			"in_reply_to_tweet_id": strings.TrimSpace(replyToTweetID),
+		}
 	}
 
 	mediaIDs := uniqueNonEmpty(mediaIDs(media))
@@ -817,6 +876,18 @@ func (p *Poster) CreateTweet(ctx context.Context, text string, media []MediaRef)
 	}
 
 	return nil, err
+}
+
+func (p *Poster) GetTimeline(ctx context.Context, params xdk.Params) (xdk.JSON, error) {
+	pager := p.client.Users.GetTimeline(params)
+	page, ok, err := pager.Next(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return xdk.JSON{"data": []any{}, "meta": map[string]any{"result_count": 0}}, nil
+	}
+	return page, nil
 }
 
 func mediaIDs(items []MediaRef) []string {

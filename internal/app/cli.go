@@ -193,7 +193,7 @@ func runTweetCommand(args []string) error {
 		uploaded = append(uploaded, ref)
 	}
 
-	tweetResp, err := poster.CreateTweet(ctx, tweetText, uploaded)
+	tweetResp, err := poster.CreateTweet(ctx, tweetText, uploaded, "")
 	if err != nil {
 		return err
 	}
